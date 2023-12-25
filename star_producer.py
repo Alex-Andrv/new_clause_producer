@@ -14,10 +14,13 @@ import redis
 import os
 import shutil
 
+from pysat.formula import CNF
+
 HOST = None
 PORT = None
 REDIS_DECODE_RESPONSES = True
-GLOBAL_TIME_LOG_DICT: [str, float] = defaultdict(int)
+GLOBAL_TIME_FUNCTION_LOG_DICT: [str, float] = defaultdict(int)
+CLAUSE_DATABASE: set[tuple[int, ...]] = set()
 
 
 def timing_decorator(func):
@@ -26,7 +29,8 @@ def timing_decorator(func):
         result = func(*args, **kwargs)
         end_time = time.time()
         elapsed_time = end_time - start_time
-        GLOBAL_TIME_LOG_DICT[func.__name__] += elapsed_time
+        global GLOBAL_TIME_FUNCTION_LOG_DICT
+        GLOBAL_TIME_FUNCTION_LOG_DICT[func.__name__] += elapsed_time
         return result
 
     return wrapper
@@ -90,13 +94,12 @@ def find_backdoors(
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     stdout, stderr = process.communicate()
-    print(command)
-    print(stdout)
-    print(stderr)
 
     if process.returncode == 0:
         with open(log_dir / "find_backdoors_strout", 'w') as find_backdoors_stdout_file:
             find_backdoors_stdout_file.write(stdout.decode('utf-8'))
+            find_backdoors_stdout_file.write("Error\n")
+            find_backdoors_stdout_file.write(stderr.decode('utf-8'))
         print("Find backdoors process was successful")
     else:
         raise Exception(f"There are exception during find backdoors files "
@@ -132,7 +135,7 @@ def combine(path_cnf, add_clauses, combine_path):
 def derive(derive_bin: Path, combine_path_cnf: Path, backdoors_path: Path, path_tmp_dir: Path, log_dir: Path,
            mini_conf: int):
     derived_clauses = path_tmp_dir / "derived.txt"
-    command = f"python {derive_bin} {combine_path_cnf} --backdoors @{backdoors_path} --num-conflicts {mini_conf} -o {derived_clauses}"
+    command = f"{derive_bin} {combine_path_cnf} --backdoors @{backdoors_path} --num-conflicts {mini_conf} -o {derived_clauses}"
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
 
@@ -293,10 +296,10 @@ def _split_clause(clauses):
 
 
 @timing_decorator
-def sift(minimize_clauses, add_clauses):
-    minimize_clauses_tuple = set(map(tuple, map(sorted, minimize_clauses)))
-    add_clauses_tuple = set(map(tuple, map(sorted, add_clauses)))
-    return minimize_clauses_tuple - add_clauses_tuple
+def sift(minimize_clauses: list[list[int]]):
+    minimize_clauses_tuple: set[tuple[int, ...]] = set(map(tuple, map(sorted, minimize_clauses)))
+    global CLAUSE_DATABASE
+    return minimize_clauses_tuple - CLAUSE_DATABASE
 
 
 @timing_decorator
@@ -365,7 +368,7 @@ def parse_backdoors_path(minimize_file) -> list[list[int]]:
     for clause in clauses:
         if clause[-1] != '0':
             raise Exception("Invalid derive format")
-    return [list(map(int, clause)) for clause in clauses]
+    return [list(map(int, clause[:-1])) for clause in clauses]
 
 
 @timing_decorator
@@ -406,6 +409,7 @@ def find_unique_derive(add_clauses, buffer_size, combine_path_cnf, derive_bin, e
     print(f'Iteration {i}: new learnts: {read_learnt}')
     log_dir = root_log_dir / f"{i}"
     os.makedirs(log_dir)
+    add_to_clause_database(sift(add_clauses))
     add_learnts(add_clauses, combine_path_cnf)
     minimize_clauses = get_derive_backdoor(
         combine_path_cnf,
@@ -417,10 +421,12 @@ def find_unique_derive(add_clauses, buffer_size, combine_path_cnf, derive_bin, e
         log_dir,
         derive_bin,
         search_bin)
-    add_learnts(path_cnf, minimize_clauses, combine_path_cnf)
+
     last_processed_learnt += read_learnt
     read_learnt, add_clauses, delete_clauses = get_learnts(last_processed_learnt, buffer_size)
-    sift_clause = sift(minimize_clauses, add_clauses)
+    add_to_clause_database(sift(add_clauses))
+    sift_clause = sift(minimize_clauses)
+    add_learnts(sift_clause, combine_path_cnf)
     print(f"Iteration {i}: save backdoors")
     push_to_queue_clause(sift_clause)
     return add_clauses, log_dir, minimize_clauses, sift_clause, last_processed_learnt
@@ -429,15 +435,16 @@ def find_unique_derive(add_clauses, buffer_size, combine_path_cnf, derive_bin, e
 def save_statistics(minimize_clauses, add_clauses, sift_clause, log_dir):
     with open(log_dir / "statistics", "w") as statistics_file:
         statistics_file.write(f"All minimized clause: {len(minimize_clauses)} \n")
-        statistics_file.write(f"Get clause from Reids: {len(add_clauses)}")
-        statistics_file.write(f"Get derived info: {len(sift_clause)}")
+        statistics_file.write(f"Get clause from Reids: {len(add_clauses)} \n")
+        statistics_file.write(f"Get derived info: {len(sift_clause)} \n")
 
         minimize_clauses_split = _split_clause(minimize_clauses)
 
         for key, learnts_v in minimize_clauses_split.items():
             statistics_file.write(f"deriving {key} where {len(learnts_v)}: {learnts_v} \n")
 
-        derived = _get_statistics(minimize_clauses, add_clauses)
+        global CLAUSE_DATABASE
+        derived = _get_statistics(minimize_clauses, CLAUSE_DATABASE)
         for key, learnts_v in derived.items():
             statistics_file.write(f"real deriving unique {key} where {len(learnts_v)}: {learnts_v} \n")
 
@@ -447,11 +454,17 @@ def save_statistics(minimize_clauses, add_clauses, sift_clause, log_dir):
                 key], f"sets mast be equals {derived[key]} :: {sift_clause_split[key]}"
 
         statistics_file.write(f"current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} \n")
-        all_time = GLOBAL_TIME_LOG_DICT.pop("find_unique_derive")
+        global GLOBAL_TIME_FUNCTION_LOG_DICT
+        all_time = GLOBAL_TIME_FUNCTION_LOG_DICT.pop("find_unique_derive")
         statistics_file.write(f"calculation time, seconds: {all_time}\n")
-        global GLOBAL_TIME_LOG_DICT
-        for function_name, time in GLOBAL_TIME_LOG_DICT.items():
+        for function_name, time in sorted(GLOBAL_TIME_FUNCTION_LOG_DICT.items(), key=lambda x: x[1], reverse=True):
             statistics_file.write(f"{function_name}={time} seconds: {time / all_time * 100} %\n")
+
+
+@timing_decorator
+def add_to_clause_database(clauses: list[list[int]]):
+    global CLAUSE_DATABASE
+    CLAUSE_DATABASE.update({tuple(sorted(clause)) for clause in clauses})
 
 
 @click.command(context_settings=CONTEXT_SETTINGS)
@@ -459,7 +472,7 @@ def save_statistics(minimize_clauses, add_clauses, sift_clause, log_dir):
 @click.option("--derive-bin", "derive_bin", required=True, type=click.Path(exists=True), help="Path to derive exe file")
 @click.option("--search-bin", "search_bin", required=True, type=click.Path(exists=True), help="Path to search exe file")
 @click.option("--tmp", "path_tmp_dir", required=True, type=click.Path(exists=False), help="Path temporary directory")
-@click.option("--ea-num-runs", "ea_num_runs", default=2, show_default=True, type=int, help="Count backdoors")
+@click.option("--ea-num-runs", "ea_num_runs", default=10, show_default=True, type=int, help="Count backdoors")
 @click.option("--random-seed", "seed", default=42, show_default=True, type=int, help="seed")
 @click.option("--ea-instance-size", "ea_instance_size", default=10, show_default=True, type=int,
               help="Size of backdoor")
@@ -485,11 +498,11 @@ def start_producer(path_cnf: str,
                    root_log_dir: str,
                    redis_host: str,
                    redis_port: int):
-    path_cnf = Path(path_cnf)
-    derive_bin = Path(derive_bin)
-    search_bin = Path(search_bin)
-    path_tmp_dir = Path(path_tmp_dir)
-    root_log_dir = Path(root_log_dir)
+    path_cnf = Path(os.path.abspath(path_cnf))
+    derive_bin = Path(os.path.abspath(derive_bin))
+    search_bin = Path(os.path.abspath(search_bin))
+    path_tmp_dir = Path(os.path.abspath(path_tmp_dir))
+    root_log_dir = Path(os.path.abspath(root_log_dir))
 
     random.seed(seed)
 
@@ -505,8 +518,10 @@ def start_producer(path_cnf: str,
 
     combine_path_cnf = path_tmp_dir / "combine.cnf"
     init_combine_cnf(combine_path_cnf, path_cnf)
+    add_to_clause_database(CNF(from_file=path_cnf))
 
     read_learnt, add_clauses, delete_clauses = get_learnts(last_processed_learnt, buffer_size)
+
     for i in itertools.count():
         add_clauses, log_dir, minimize_clauses, sift_clause, last_processed_learnt = (
             find_unique_derive(add_clauses, buffer_size,
@@ -516,8 +531,8 @@ def start_producer(path_cnf: str,
                                mini_conf, path_cnf, path_tmp_dir,
                                read_learnt, root_log_dir, search_bin))
         save_statistics(minimize_clauses, add_clauses, sift_clause, log_dir)
-        global GLOBAL_TIME_LOG_DICT
-        GLOBAL_TIME_LOG_DICT = defaultdict(int)
+        global GLOBAL_TIME_FUNCTION_LOG_DICT
+        GLOBAL_TIME_FUNCTION_LOG_DICT = defaultdict(int)
 
 
 if __name__ == "__main__":
