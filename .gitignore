@@ -1,0 +1,7 @@
+*.idea/*
+
+/backdoor-producer/tmp/*
+*/tmp*
+/log/
+__pycache__
+tmp
