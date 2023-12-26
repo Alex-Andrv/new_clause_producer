@@ -191,6 +191,7 @@ def push_to_queue_clause(backdoors):
     for i, backdoor in enumerate(backdoors):
         key = f'to_minisat'
         value = " ".join(map(str, backdoor)) + " 0"
+        print(f"{key}:{value}")
         con.lpush(key, value)
     con.close()
 
